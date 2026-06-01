@@ -97,6 +97,23 @@ type VfioDeviceInfo struct {
 	iommuGroup             int
 	iommuFDEnabled         bool
 	addressableMemoryBytes uint64
+
+	// Fabric Manager attributes (HGX systems with NVSwitch). Populated only
+	// when an FM Manager is available at discovery time; left zero/empty
+	// otherwise so non-HGX nodes publish exactly the same ResourceSlice as
+	// before.
+	//
+	// gpuModuleID is the per-board physical ID returned by
+	// nvmlDeviceGetModuleId. It corresponds to the FM partition member
+	// physicalId and is what the design doc calls `gpuModuleId`.
+	//
+	// partitionsBySize maps an FM partition size (number of GPUs in the
+	// partition) to the partitionId of the partition of that size that
+	// includes this GPU. Used to publish the `partition1`/`partition2`/
+	// `partition4`/`partition8` device attributes described in the design
+	// doc's "Fabric Manager Advertised by Partition" strategy.
+	gpuModuleID      int
+	partitionsBySize map[int]int
 }
 
 // CanonicalName returns the nameused for device announcement (in ResourceSlice
@@ -272,5 +289,45 @@ func (d *VfioDeviceInfo) GetDevice() resourceapi.Device {
 		device.Attributes[d.pcieRootAttr.Name] = d.pcieRootAttr.Value
 	}
 
+	d.addFabricManagerAttributes(device.Attributes)
+
 	return device
+}
+
+// addFabricManagerAttributes publishes the Fabric Manager-derived attributes
+// described in the HGX virtualization design doc. There are two
+// complementary strategies:
+//
+//  1. "Fabric Manager Advertised by GPUs" — a single `gpuModuleId` integer
+//     attribute per device, matching the value reported by
+//     nvmlDeviceGetModuleId. Selectors use CEL expressions enumerating the
+//     valid module-id sets per partition (e.g. gpuModuleId == 1 or
+//     gpuModuleId == 3).
+//
+//  2. "Fabric Manager Advertised by Partition" — one integer attribute per
+//     partition size (`partition1`, `partition2`, `partition4`, `partition8`,
+//     ...) carrying the partitionId of the FM partition of that size that
+//     includes this GPU. Selectors use `matchAttribute: partitionN`.
+//
+// Both strategies are useful and both can be served from the same data, so
+// we publish both. On non-HGX nodes (no FM Manager wired up) gpuModuleID is
+// zero and partitionsBySize is empty, so this method is a no-op and the
+// ResourceSlice is unchanged from the pre-FM behavior.
+func (d *VfioDeviceInfo) addFabricManagerAttributes(attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute) {
+	if d.gpuModuleID == 0 && len(d.partitionsBySize) == 0 {
+		return
+	}
+
+	if d.gpuModuleID != 0 {
+		attrs["gpuModuleId"] = resourceapi.DeviceAttribute{
+			IntValue: ptr.To(int64(d.gpuModuleID)),
+		}
+	}
+
+	for size, partitionID := range d.partitionsBySize {
+		key := resourceapi.QualifiedName(fmt.Sprintf("partition%d", size))
+		attrs[key] = resourceapi.DeviceAttribute{
+			IntValue: ptr.To(int64(partitionID)),
+		}
+	}
 }
