@@ -329,9 +329,7 @@ func (m *Manager) GetPartitionsByModuleID(moduleID int) []int {
 
 // GetPartitionsBySizeByModuleID returns a map keyed by partition size (number
 // of GPUs in the partition) to the partitionId of the partition of that size
-// that includes the given gpuModuleId. This is the shape the design doc's
-// "Fabric Manager Advertised by Partition" strategy publishes on each
-// ResourceSlice device, e.g.:
+// that includes the given gpuModuleId. e.g.:
 //
 //	gpuModuleId: 1
 //	partition1:  8
@@ -375,6 +373,47 @@ func (m *Manager) GetPartitionsBySizeByPCI(pciBusID string) (map[int]int, bool, 
 	}
 	out, err := m.GetPartitionsBySizeByModuleID(moduleID)
 	return out, true, err
+}
+
+// FindPartitionByModuleIDs returns the partitionId of the FM partition whose
+// GPU member set is exactly equal to the given set of gpuModuleIds, or
+// (0, false) if no partition matches. This is how the DRA driver maps the set
+// of GPUs allocated to a single claim (for passthrough) onto the FM partition
+// it must activate: the scheduler selects GPUs that share a partitionN
+// attribute, and this method recovers that partition at prepare/unprepare time.
+//
+// Duplicate module IDs in the input never match (a partition cannot contain
+// the same GPU twice), so callers don't need to de-duplicate first.
+func (m *Manager) FindPartitionByModuleIDs(moduleIDs []int) (int, bool) {
+	if len(moduleIDs) == 0 {
+		return 0, false
+	}
+	want := make(map[int]struct{}, len(moduleIDs))
+	for _, id := range moduleIDs {
+		want[id] = struct{}{}
+	}
+	if len(want) != len(moduleIDs) {
+		return 0, false
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, p := range m.partitionsByID {
+		if len(p.GPUs) != len(want) {
+			continue
+		}
+		match := true
+		for _, g := range p.GPUs {
+			if _, ok := want[g.PhysicalID]; !ok {
+				match = false
+				break
+			}
+		}
+		if match {
+			return p.ID, true
+		}
+	}
+	return 0, false
 }
 
 // ActivatePartition asks Fabric Manager to program the NVSwitch fabric for
