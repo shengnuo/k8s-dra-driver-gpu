@@ -24,6 +24,7 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 )
 
@@ -314,10 +315,14 @@ func (d *VfioDeviceInfo) GetDevice() resourceapi.Device {
 // zero and partitionsBySize is empty, so this method is a no-op and the
 // ResourceSlice is unchanged from the pre-FM behavior.
 func (d *VfioDeviceInfo) addFabricManagerAttributes(attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute) {
+	klog.Infof("!!!!!!!!!!!Adding Fabric Manager attributes for %s", d.CanonicalName())
 	if d.gpuModuleID == 0 && len(d.partitionsBySize) == 0 {
+		klog.Infof("!!!!!!!!!!!No Fabric Manager attributes for %s", d.CanonicalName())
 		return
 	}
 
+	klog.Infof("!!!!!!!!!!!gpuModuleID: %d", d.gpuModuleID)
+	klog.Infof("!!!!!!!!!!!partitionsBySize: %v", d.partitionsBySize)
 	if d.gpuModuleID != 0 {
 		attrs["gpuModuleId"] = resourceapi.DeviceAttribute{
 			IntValue: ptr.To(int64(d.gpuModuleID)),

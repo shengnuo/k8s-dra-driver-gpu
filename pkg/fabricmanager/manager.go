@@ -23,6 +23,7 @@ import (
 	"sync"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+	"golang.org/x/sys/unix"
 )
 
 // Manager is the in-memory view this package exposes to the rest of the DRA
@@ -49,8 +50,8 @@ type Manager struct {
 	client Client
 	opened bool
 
-	moduleIDByPCI map[string]int
-	pciByModuleID map[int]string
+	gpuModuleIDByPCI map[string]int
+	pciByGpuModuleID map[int]string
 
 	partitionsByID map[int]Partition
 
@@ -92,15 +93,15 @@ func Open(lib NVMLDeviceLister, client Client, params ConnectParams) (*Manager, 
 	}
 
 	m := &Manager{
-		client:         client,
-		moduleIDByPCI:  make(map[string]int),
-		pciByModuleID:  make(map[int]string),
-		partitionsByID: make(map[int]Partition),
-		activated:      make(map[int]struct{}),
+		client:           client,
+		gpuModuleIDByPCI: make(map[string]int),
+		pciByGpuModuleID: make(map[int]string),
+		partitionsByID:   make(map[int]Partition),
+		activated:        make(map[int]struct{}),
 	}
 
-	if err := m.refreshFromNVML(lib); err != nil {
-		return nil, err
+	if err := m.pciIdToGpuModuleIdMap(lib); err != nil {
+		return nil, fmt.Errorf("fabricmanager: pciIdToGpuModuleIdMap: %w", err)
 	}
 
 	if err := client.Init(); err != nil {
@@ -117,7 +118,7 @@ func Open(lib NVMLDeviceLister, client Client, params ConnectParams) (*Manager, 
 		_ = client.Shutdown()
 		return nil, fmt.Errorf("fabricmanager: fmGetSupportedFabricPartitions: %w", err)
 	}
-	if err := m.installPartitions(partitions); err != nil {
+	if err := m.recordsPartitions(partitions); err != nil {
 		_ = client.Disconnect()
 		_ = client.Shutdown()
 		return nil, err
@@ -140,13 +141,13 @@ func Open(lib NVMLDeviceLister, client Client, params ConnectParams) (*Manager, 
 // joined; the second error does not mask the first.
 func (m *Manager) Close() error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if !m.opened {
-		m.mu.Unlock()
 		return nil
 	}
 	m.opened = false
 	client := m.client
-	m.mu.Unlock()
 
 	var firstErr error
 	if err := client.Disconnect(); err != nil {
@@ -158,17 +159,17 @@ func (m *Manager) Close() error {
 	return firstErr
 }
 
-// refreshFromNVML populates the gpuModuleId <-> PCI bus ID maps by walking
+// pciIdToGpuModuleIdMap populates the gpuModuleId <-> PCI bus ID maps by walking
 // every NVML-visible GPU. The maps are replaced atomically so concurrent
 // readers always see a consistent snapshot.
-func (m *Manager) refreshFromNVML(lib NVMLDeviceLister) error {
+func (m *Manager) pciIdToGpuModuleIdMap(lib NVMLDeviceLister) error {
 	count, ret := lib.DeviceGetCount()
 	if ret != nvml.SUCCESS {
 		return fmt.Errorf("fabricmanager: NVML DeviceGetCount: %v", ret)
 	}
 
-	moduleIDByPCI := make(map[string]int, count)
-	pciByModuleID := make(map[int]string, count)
+	gpuModuleIDByPCI := make(map[string]int, count)
+	pciByGpuModuleID := make(map[int]string, count)
 
 	for i := 0; i < count; i++ {
 		dev, ret := lib.DeviceGetHandleByIndex(i)
@@ -185,40 +186,40 @@ func (m *Manager) refreshFromNVML(lib NVMLDeviceLister) error {
 		if ret != nvml.SUCCESS {
 			return fmt.Errorf("fabricmanager: NVML GetPciInfo for device %d: %v", i, ret)
 		}
-		pciBusID := normalizePCIBusID(cString(pciInfo.BusId[:]))
+		pciBusID := normalizePCIBusID(unix.ByteSliceToString(pciInfo.BusId[:]))
 		if pciBusID == "" {
 			return fmt.Errorf("fabricmanager: empty PCI bus ID for device %d (moduleId=%d)", i, moduleID)
 		}
 
-		if existing, ok := pciByModuleID[moduleID]; ok {
+		if existing, ok := pciByGpuModuleID[moduleID]; ok {
 			return fmt.Errorf("fabricmanager: duplicate gpuModuleId %d for PCI bus IDs %q and %q",
 				moduleID, existing, pciBusID)
 		}
-		if existing, ok := moduleIDByPCI[pciBusID]; ok {
+		if existing, ok := gpuModuleIDByPCI[pciBusID]; ok {
 			return fmt.Errorf("fabricmanager: duplicate PCI bus ID %q for gpuModuleIds %d and %d",
 				pciBusID, existing, moduleID)
 		}
-		moduleIDByPCI[pciBusID] = moduleID
-		pciByModuleID[moduleID] = pciBusID
+		gpuModuleIDByPCI[pciBusID] = moduleID
+		pciByGpuModuleID[moduleID] = pciBusID
 	}
 
 	m.mu.Lock()
-	m.moduleIDByPCI = moduleIDByPCI
-	m.pciByModuleID = pciByModuleID
-	m.mu.Unlock()
+	defer m.mu.Unlock()
+	m.gpuModuleIDByPCI = gpuModuleIDByPCI
+	m.pciByGpuModuleID = pciByGpuModuleID
 	return nil
 }
 
-// installPartitions records the FM-supplied partitions, validating that every
+// recordsPartitions records the FM-supplied partitions, validating that every
 // gpuModuleId referenced by FM corresponds to a GPU NVML enumerated on this
 // node. A mismatch usually indicates that NVML and FM disagree about the
 // node's GPU inventory and is treated as an error.
-func (m *Manager) installPartitions(parts []Partition) error {
-	byID := make(map[int]Partition, len(parts))
+func (m *Manager) recordsPartitions(parts []Partition) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	m.mu.RLock()
-	pciByModuleID := m.pciByModuleID
-	m.mu.RUnlock()
+	byID := make(map[int]Partition, len(parts))
+	pciByGpuModuleID := m.pciByGpuModuleID
 
 	for _, p := range parts {
 		if _, dup := byID[p.ID]; dup {
@@ -234,7 +235,7 @@ func (m *Manager) installPartitions(parts []Partition) error {
 					p.ID, g.PhysicalID)
 			}
 			seen[g.PhysicalID] = struct{}{}
-			if _, known := pciByModuleID[g.PhysicalID]; !known {
+			if _, known := pciByGpuModuleID[g.PhysicalID]; !known {
 				return fmt.Errorf("fabricmanager: partition %d references unknown gpuModuleId %d (not present in NVML)",
 					p.ID, g.PhysicalID)
 			}
@@ -242,9 +243,7 @@ func (m *Manager) installPartitions(parts []Partition) error {
 		byID[p.ID] = p
 	}
 
-	m.mu.Lock()
 	m.partitionsByID = byID
-	m.mu.Unlock()
 	return nil
 }
 
@@ -256,7 +255,7 @@ func (m *Manager) GetModuleIDByPCI(pciBusID string) (int, bool) {
 	key := normalizePCIBusID(pciBusID)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	id, ok := m.moduleIDByPCI[key]
+	id, ok := m.gpuModuleIDByPCI[key]
 	return id, ok
 }
 
@@ -265,7 +264,7 @@ func (m *Manager) GetModuleIDByPCI(pciBusID string) (int, bool) {
 func (m *Manager) GetPCIByModuleID(moduleID int) (string, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	pci, ok := m.pciByModuleID[moduleID]
+	pci, ok := m.pciByGpuModuleID[moduleID]
 	return pci, ok
 }
 
@@ -469,7 +468,7 @@ func (m *Manager) RefreshPartitions() error {
 	if err != nil {
 		return fmt.Errorf("fabricmanager: fmGetSupportedFabricPartitions: %w", err)
 	}
-	if err := m.installPartitions(parts); err != nil {
+	if err := m.recordsPartitions(parts); err != nil {
 		return err
 	}
 	m.mu.Lock()
@@ -548,15 +547,7 @@ func (m *Manager) markActivated(partitionID int, active bool) {
 	m.mu.Unlock()
 }
 
-// normalizePCIBusID converts a PCI bus ID into a canonical form that compares
-// equal across producers. Producers differ in two ways:
-//   - hex casing: NVML emits upper-case; sysfs / Kubernetes resource
-//     attributes typically use lower-case.
-//   - domain width: NVML's PciInfo.BusId uses an 8-digit domain
-//     ("00000000:3B:00.0"), while sysfs and most Kubernetes attributes use a
-//     4-digit domain ("0000:3b:00.0").
-//
-// We canonicalize to upper-case with an 8-digit domain. Inputs without a
+// normalizePCIBusID canonicalize to upper-case with an 8-digit domain. Inputs without a
 // domain segment ("3b:00.0") or otherwise unparseable are returned upper-cased
 // and trimmed without further mangling so callers still see a stable key.
 func normalizePCIBusID(s string) string {
@@ -573,15 +564,4 @@ func normalizePCIBusID(s string) string {
 		domain = domain[len(domain)-8:]
 	}
 	return domain + ":" + rest
-}
-
-// cString converts a NUL-terminated byte slice (as used in NVML C structs)
-// into a Go string by truncating at the first NUL.
-func cString(b []byte) string {
-	for i, c := range b {
-		if c == 0 {
-			return string(b[:i])
-		}
-	}
-	return string(b)
 }

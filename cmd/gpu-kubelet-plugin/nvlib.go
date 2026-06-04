@@ -111,19 +111,25 @@ func newDeviceLib(driverRoot root) (*deviceLib, error) {
 	return &d, nil
 }
 
-// Fabric Manager connection defaults. nv-fabricmanager listens on TCP
-// 127.0.0.1:6666 by default; deployments that expose a unix socket instead can
-// override via the environment variables below.
+// Fabric Manager connection environment variables and their defaults. By
+// default the driver connects to nv-fabricmanager over its unix socket; set
+// NVIDIA_FABRICMANAGER_ADDRESS to connect over TCP instead (the FM port is
+// implied by the SDK).
 const (
-	// fmAddressEnvvar overrides the FM TCP address (host, the FM port is
-	// implied by the SDK). Empty uses the go-nvfm default (127.0.0.1).
+	// fmAddressEnvvar selects the FM TCP transport and sets the host to
+	// connect to. When this variable is set (even to ""), TCP is used and an
+	// empty value falls back to defaultFMAddress.
 	fmAddressEnvvar = "NVIDIA_FABRICMANAGER_ADDRESS"
-	// fmUnixSocketEnvvar, when set, makes the driver connect over the given
-	// unix socket path instead of TCP. Takes precedence over fmAddressEnvvar.
+	// fmUnixSocketEnvvar overrides the unix socket path used when TCP is not
+	// selected. An empty value falls back to defaultFMUnixSocket.
 	fmUnixSocketEnvvar = "NVIDIA_FABRICMANAGER_UNIX_SOCKET"
-	// fmLibraryPathEnvvar overrides the libnvfm.so path. Empty relies on the
-	// dynamic loader's search path.
+	// fmLibraryPathEnvvar overrides the libnvfm.so path. An empty value falls
+	// back to defaultFMLibraryPath.
 	fmLibraryPathEnvvar = "NVIDIA_FABRICMANAGER_LIBRARY_PATH"
+
+	defaultFMAddress     = "127.0.0.1"
+	defaultFMUnixSocket  = "/run/nvidia-fabricmanager/socket"
+	defaultFMLibraryPath = "/usr/lib/libnvfm.so"
 )
 
 // tryOpenFabricManager attempts to build an FM Manager backed by go-nvfm. It
@@ -132,21 +138,36 @@ const (
 // Open walks the GPUs to build the gpuModuleId <-> PCI map; ensureNVML
 // guarantees that for the duration of the call.
 func (l deviceLib) tryOpenFabricManager() *fabricmanager.Manager {
+	klog.Infof("!!!!!!!!!!!tryOpenFabricManager")
 	shutdown, ret := l.ensureNVML()
 	if ret != nvml.SUCCESS {
 		klog.Warningf("Fabric Manager: NVML unavailable, skipping FM discovery: %s", ret)
 		return nil
 	}
 	defer shutdown()
+	klog.Infof("!!!!!!!!!!!ensureNVML done")
 
-	client := fabricmanager.NewClient(os.Getenv(fmLibraryPathEnvvar))
+	libPath := defaultFMLibraryPath
+	if v, ok := os.LookupEnv(fmLibraryPathEnvvar); ok && v != "" {
+		libPath = v
+	}
+	client := fabricmanager.NewClient(libPath)
 
+	// Prefer TCP only when NVIDIA_FABRICMANAGER_ADDRESS is explicitly set;
+	// otherwise connect over the unix socket (the default transport).
 	params := fabricmanager.ConnectParams{}
-	if socket := os.Getenv(fmUnixSocketEnvvar); socket != "" {
+	if addr, ok := os.LookupEnv(fmAddressEnvvar); ok {
+		if addr == "" {
+			addr = defaultFMAddress
+		}
+		params.AddressInfo = addr
+	} else {
+		socket := defaultFMUnixSocket
+		if v, ok := os.LookupEnv(fmUnixSocketEnvvar); ok && v != "" {
+			socket = v
+		}
 		params.AddressInfo = socket
 		params.AddressIsUnixSocket = true
-	} else if addr := os.Getenv(fmAddressEnvvar); addr != "" {
-		params.AddressInfo = addr
 	}
 
 	fmMgr, err := fabricmanager.Open(l.nvmllib, client, params)
@@ -155,7 +176,7 @@ func (l deviceLib) tryOpenFabricManager() *fabricmanager.Manager {
 		return nil
 	}
 
-	klog.V(1).Infof("Fabric Manager connection established; FM partition attributes enabled")
+	klog.Infof("!!!!!!!!!!!Fabric Manager connection established; FM partition attributes enabled")
 	return fmMgr
 }
 
@@ -783,6 +804,7 @@ func (l deviceLib) getVfioDeviceInfo(idx int, device *nvpci.NvidiaPCIDevice) (*V
 // failing the entire kubelet plugin if FM and NVML disagree about a single
 // device, while still surfacing the discrepancy in logs.
 func (l deviceLib) attachFabricManagerInfo(d *VfioDeviceInfo) error {
+	klog.Infof("!!!!!!!!!!!attachFabricManagerInfo: %s", d.CanonicalName())
 	if l.fmManager == nil {
 		return nil
 	}

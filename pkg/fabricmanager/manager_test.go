@@ -25,7 +25,7 @@ import (
 )
 
 // fakeDevice is a minimal stand-in for nvml.Device that only implements the
-// methods Manager.refreshFromNVML calls. Other methods of the embedded
+// methods Manager.pciIdToGpuModuleIdMap calls. Other methods of the embedded
 // nvml.Device interface remain nil and will panic if invoked, which is the
 // desired behavior for unexpected production calls in a test.
 type fakeDevice struct {
