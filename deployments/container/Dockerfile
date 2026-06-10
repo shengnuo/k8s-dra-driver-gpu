@@ -103,15 +103,37 @@ RUN apt-get update \
 # The distroless runtime image has no package manager, so install the FM SDK
 # package here and copy the resulting library into the final image below.
 FROM nvcr.io/nvidia/base/ubuntu:jammy-20260217 AS fabricmanager
-# Install the FM SDK and stage libnvfm.so (+ versioned soname) into an
-# arch-neutral directory. The package installs into the target arch's multiarch
-# dir (e.g. x86_64-linux-gnu or aarch64-linux-gnu), so we normalize the location
-# here and copy with -a to preserve the symlink chain.
+
+# Pinned revision of NVIDIA/Fabric-Manager-Client used to build fmpm.
+ARG FMPM_REPO=https://github.com/NVIDIA/Fabric-Manager-Client.git
+ARG FMPM_COMMIT=58c6738d5789f9880e96466623e24d0d7c5f4303
+
+# Install the FM SDK (headers + libnvfm.so) plus the toolchain and deps needed
+# to build fmpm. Per the fmpm README, building requires the FM development
+# package (nv_fm_agent.h + the unversioned libnvfm.so symlink) and the jsoncpp
+# development package (libjsoncpp-dev on Ubuntu).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends nvidia-fabricmanager-dev-580 \
- && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives \
- && mkdir -p /fm-lib \
- && cp -a /usr/lib/*-linux-gnu/libnvfm.so* /fm-lib/
+ && apt-get install -y --no-install-recommends \
+        nvidia-fabricmanager-dev-580 \
+        g++ git ca-certificates pkg-config \
+        libjsoncpp-dev \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives
+
+# Stage libnvfm.so and libjsoncpp.so (+ their versioned sonames) into an
+# arch-neutral directory. The packages install into the target arch's multiarch
+# dir (e.g. x86_64-linux-gnu or aarch64-linux-gnu), so we normalize the location
+# here and copy with -a to preserve the symlink chain. fmpm dynamically links
+# both libraries, so libjsoncpp must accompany it into the distroless image.
+RUN mkdir -p /fm-lib \
+ && cp -a /usr/lib/*-linux-gnu/libnvfm.so* /fm-lib/ \
+ && cp -a /usr/lib/*-linux-gnu/libjsoncpp.so* /fm-lib/
+
+# Build fmpm from the pinned revision and stage the binary. It links against
+# libnvfm and libjsoncpp installed above.
+RUN git clone "${FMPM_REPO}" /fmpm-src \
+ && git -C /fmpm-src checkout --quiet "${FMPM_COMMIT}" \
+ && mkdir -p /fm-bin \
+ && g++ -o /fm-bin/fmpm /fmpm-src/fmpm.cpp $(pkg-config --cflags jsoncpp) -lnvfm -ljsoncpp
 
 # Pull the nvidia-cdi-hook binary out of the relevant toolkit container
 # (arch: TARGETPLATFORM, set via --platform).
@@ -146,10 +168,15 @@ COPY LICENSE /
 
 COPY --from=bash    /bin/bash-static                          /bin/bash
 
-# Fabric Manager SDK shared library (and its versioned soname) so the
-# gpu-kubelet-plugin can dlopen libnvfm.so at runtime. Placed in /usr/lib so the
-# path is arch-neutral and resolvable via an absolute dlopen.
+# Fabric Manager SDK shared library (libnvfm.so) plus libjsoncpp, with their
+# versioned sonames. libnvfm.so is dlopen'd at runtime by the cgo-backed FM
+# client; libnvfm + libjsoncpp are also the load-time deps of the fmpm CLI
+# below. Placed in /usr/lib so paths are arch-neutral and resolvable.
 COPY --from=fabricmanager /fm-lib/ /usr/lib/
+
+# fmpm partition-management CLI (NVIDIA/Fabric-Manager-Client), used by the
+# gpu-kubelet-plugin's fmpm-backed Fabric Manager client.
+COPY --from=fabricmanager /fm-bin/fmpm /usr/bin/fmpm
 
 COPY --from=toolkit /artifacts/rpm/usr/bin/nvidia-cdi-hook    /usr/bin/nvidia-cdi-hook
 COPY --from=build   /artifacts/compute-domain-controller      /usr/bin/compute-domain-controller
@@ -169,6 +196,9 @@ COPY --from=build /etc/passwd /etc/passwd
 COPY --from=build /etc/group /etc/group
 USER root:root
 
-# Smoke-test executables (provide early build feedback).
+# Smoke-test executables (provide early build feedback). `fmpm -v` prints its
+# version and exits before connecting to FM, so it also validates that fmpm's
+# shared-library deps (libnvfm, libjsoncpp) resolve in the final image.
 RUN ["/usr/bin/compute-domain-kubelet-plugin", "--version"]
 RUN ["/bin/bash", "--version"]
+RUN ["/usr/bin/fmpm", "-v"]

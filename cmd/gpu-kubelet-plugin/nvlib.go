@@ -123,20 +123,23 @@ const (
 	// fmUnixSocketEnvvar overrides the unix socket path used when TCP is not
 	// selected. An empty value falls back to defaultFMUnixSocket.
 	fmUnixSocketEnvvar = "NVIDIA_FABRICMANAGER_UNIX_SOCKET"
-	// fmLibraryPathEnvvar overrides the libnvfm.so path. An empty value falls
-	// back to defaultFMLibraryPath.
-	fmLibraryPathEnvvar = "NVIDIA_FABRICMANAGER_LIBRARY_PATH"
+	// fmpmBinaryPathEnvvar overrides the path to the fmpm CLI binary. An
+	// empty value falls back to defaultFMPMBinaryPath.
+	fmpmBinaryPathEnvvar = "NVIDIA_FABRICMANAGER_FMPM_PATH"
 
-	defaultFMAddress     = "127.0.0.1"
-	defaultFMUnixSocket  = "/run/nvidia-fabricmanager/socket"
-	defaultFMLibraryPath = "/usr/lib/libnvfm.so"
+	defaultFMAddress    = "127.0.0.1"
+	defaultFMUnixSocket = "/run/nvidia-fabricmanager/socket"
+	// defaultFMPMBinaryPath matches where the container image installs the
+	// fmpm CLI (see deployments/container/Dockerfile).
+	defaultFMPMBinaryPath = "/usr/bin/fmpm"
 )
 
-// tryOpenFabricManager attempts to build an FM Manager backed by go-nvfm. It
-// returns nil (and logs a warning) on any failure so the kubelet plugin keeps
-// running with FM-derived attributes omitted. NVML must be available while
-// Open walks the GPUs to build the gpuModuleId <-> PCI map; ensureNVML
-// guarantees that for the duration of the call.
+// tryOpenFabricManager attempts to build an FM Manager backed by the fmpm CLI
+// (NVIDIA/Fabric-Manager-Client). It returns nil (and logs a warning) on any
+// failure so the kubelet plugin keeps running with FM-derived attributes
+// omitted. NVML must be available while Open walks the GPUs to build the
+// gpuModuleId <-> PCI map; ensureNVML guarantees that for the duration of the
+// call.
 func (l deviceLib) tryOpenFabricManager() *fabricmanager.Manager {
 	klog.Infof("!!!!!!!!!!!tryOpenFabricManager")
 	shutdown, ret := l.ensureNVML()
@@ -147,11 +150,11 @@ func (l deviceLib) tryOpenFabricManager() *fabricmanager.Manager {
 	defer shutdown()
 	klog.Infof("!!!!!!!!!!!ensureNVML done")
 
-	libPath := defaultFMLibraryPath
-	if v, ok := os.LookupEnv(fmLibraryPathEnvvar); ok && v != "" {
-		libPath = v
+	binPath := defaultFMPMBinaryPath
+	if v, ok := os.LookupEnv(fmpmBinaryPathEnvvar); ok && v != "" {
+		binPath = v
 	}
-	client := fabricmanager.NewClient(libPath)
+	client := fabricmanager.NewFMPMClient(binPath)
 
 	// Prefer TCP only when NVIDIA_FABRICMANAGER_ADDRESS is explicitly set;
 	// otherwise connect over the unix socket (the default transport).
